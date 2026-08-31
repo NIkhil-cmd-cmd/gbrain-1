@@ -213,8 +213,14 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     if (FILE_PLANE_DOTTED_KEYS.has(key)) {
       const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
       const cfg = loadConfigFileOnly();
-      const [top, leaf] = key.split('.') as ['push' | 'hooks' | 'backup', string];
-      const branch = cfg?.[top] as Record<string, unknown> | undefined;
+      // Walks the whole dotted path. Destructuring [top, leaf] cannot reach a
+      // three-segment key like integrations.memorable.enabled, which is why
+      // that key had to be kept out of this set and special-cased in the SET
+      // lane; with the walk it can just be a member like any other.
+      const parts = key.split('.');
+      const leaf = parts.pop() as string;
+      let branch = cfg as unknown as Record<string, unknown> | undefined;
+      for (const seg of parts) branch = branch?.[seg] as Record<string, unknown> | undefined;
       if (cfg && branch && leaf in branch) {
         delete branch[leaf];
         saveConfig(cfg);

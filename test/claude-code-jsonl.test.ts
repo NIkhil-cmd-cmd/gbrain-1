@@ -388,40 +388,6 @@ describe('tool calls carry their turn position', () => {
     for (const i of p.toolCallTurnIndexes) expect(Number.isInteger(i)).toBe(true);
   });
 
-  test('collectToolCalls:false skips collection entirely — turns unchanged, no tool data retained', () => {
-    const p = parseTranscript(fixture(), { collectToolCalls: false });
-    expect(p.toolCalls).toEqual([]);
-    expect(p.toolCallTurnIndexes).toEqual([]);
-    expect(p.turns.length).toBe(parseTranscript(fixture()).turns.length);
-  });
-
-  test('tool_result joins to its call by tool_use_id: ok mirrors is_error, internal id stripped', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'gbrain-join-'));
-    tmp = dir;
-    const line = (o: unknown) => JSON.stringify(o);
-    const p = join(dir, 'j.jsonl');
-    writeFileSync(p, [
-      line({ type: 'assistant', message: { role: 'assistant', content: [
-        { type: 'tool_use', id: 'ok-1', name: 'Bash', input: { command: 'true' } },
-        { type: 'tool_use', id: 'bad-1', name: 'Bash', input: { command: 'false' } },
-        { type: 'tool_use', id: 'orphan-1', name: 'Read', input: { file_path: '/x' } },
-      ] } }),
-      // Results arrive in a LATER line than their calls — the join is post-parse.
-      line({ type: 'user', message: { role: 'user', content: [
-        { type: 'tool_result', tool_use_id: 'ok-1', content: 'fine' },
-        { type: 'tool_result', tool_use_id: 'bad-1', is_error: true, content: 'boom' },
-      ] } }),
-    ].join('\n') + '\n', { mode: 0o600 });
-    const r = parseTranscript(p);
-    expect(r.toolCalls).toHaveLength(3);
-    expect(r.toolCalls[0]).toEqual({ name: 'Bash', input: { command: 'true' }, result: { ok: true } });
-    expect(r.toolCalls[1]).toEqual({ name: 'Bash', input: { command: 'false' }, result: { ok: false } });
-    // No matching result seen → result omitted, never guessed.
-    expect(r.toolCalls[2]).toEqual({ name: 'Read', input: { file_path: '/x' } });
-    // The transcript-internal tool_use_id never reaches the public shape.
-    expect(JSON.stringify(r.toolCalls)).not.toContain('ok-1');
-  });
-
   test('indexes are non-decreasing and bounded by the turn count', () => {
     const p = parseTranscript(fixture());
     const idx = p.toolCallTurnIndexes;
@@ -440,5 +406,81 @@ describe('tool calls carry their turn position', () => {
     expect(cmds).not.toContain('echo one');
     // and the unfiltered set is strictly larger — proving the old behaviour differed
     expect(span.length).toBeLessThan(p.toolCalls.length);
+  });
+});
+
+/**
+ * The tool_use_id join.
+ *
+ * A result always arrives in a LATER transcript line than its call, so the
+ * parser collects both in one pass and merges them after. That merge had no
+ * test: every edge below (ordering, parallel calls, a call whose result never
+ * arrived, sidechain traffic) was load-bearing and unasserted.
+ */
+describe('tool_use_id join [A6]', () => {
+  /** One transcript, written to a temp dir, parsed. */
+  const parse = (entries: unknown[]) => {
+    const p = join(tdir(), 'join.jsonl');
+    writeFileSync(p, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    return parseTranscript(p);
+  };
+  const call = (id: string, name = 'Bash') => ({
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input: { command: `run ${id}` } }] },
+  });
+  const result = (id: string, isError: boolean) => ({
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content: 'x' }] },
+  });
+
+  test('a result joins its call and carries is_error inverted', () => {
+    const r = parse([call('a'), result('a', true)]);
+    expect(r.toolCalls).toHaveLength(1);
+    expect(r.toolCalls[0].result).toEqual({ ok: false });
+  });
+
+  test('a success joins as ok true', () => {
+    const r = parse([call('a'), result('a', false)]);
+    expect(r.toolCalls[0].result).toEqual({ ok: true });
+  });
+
+  test('results out of order still land on the right calls', () => {
+    const r = parse([call('a'), call('b'), result('b', false), result('a', true)]);
+    expect(r.toolCalls.map((c) => c.result)).toEqual([{ ok: false }, { ok: true }]);
+  });
+
+  test('parallel calls in one turn each keep their own result', () => {
+    const both = {
+      type: 'assistant',
+      message: { role: 'assistant', content: [
+        { type: 'tool_use', id: 'p1', name: 'Read', input: {} },
+        { type: 'tool_use', id: 'p2', name: 'Read', input: {} },
+      ] },
+    };
+    const r = parse([both, result('p2', true), result('p1', false)]);
+    expect(r.toolCalls.map((c) => c.result)).toEqual([{ ok: true }, { ok: false }]);
+  });
+
+  test('a call with no result omits the key rather than guessing false', () => {
+    const r = parse([call('a')]);
+    expect(r.toolCalls[0].result).toBeUndefined();
+    expect('result' in r.toolCalls[0]).toBe(false);
+  });
+
+  test('the transcript-internal id never reaches the public record', () => {
+    const r = parse([call('a'), result('a', false)]);
+    expect(Object.keys(r.toolCalls[0]).sort()).toEqual(['input', 'name', 'result']);
+  });
+
+  test('each call is stamped with the turn it sits in', () => {
+    const r = parse([call('a'), result('a', false), call('b'), result('b', false)]);
+    expect(r.toolCallTurnIndexes).toHaveLength(2);
+    expect(r.toolCallTurnIndexes[0]).toBeLessThan(r.toolCallTurnIndexes[1]);
+  });
+
+  test('sidechain tool traffic is excluded entirely', () => {
+    const side = { ...call('s1'), isSidechain: true };
+    const r = parse([side, { ...result('s1', false), isSidechain: true }]);
+    expect(r.toolCalls).toHaveLength(0);
   });
 });

@@ -109,7 +109,10 @@ embedding model to choose**.
 memorable init      # standalone: procedures live in ~/.memorable on this machine.
                     # Works everywhere, needs nothing configured.
 memorable enable    # explicit write consent — run this only because your human
-                    # asked for Memorable; consent is theirs, not yours
+                    # asked for Memorable; consent is theirs, not yours.
+                    # Until it is granted nothing is stored AND nothing is
+                    # sent for extraction: the gate is on egress, not just
+                    # on the write.
 ```
 
 If this machine **already runs an initialized gbrain**, store procedures there
